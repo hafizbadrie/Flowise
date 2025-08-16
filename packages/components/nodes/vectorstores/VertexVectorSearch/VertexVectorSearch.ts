@@ -7,6 +7,7 @@ import { FLOWISE_CHATID, getBaseClasses, getCredentialData, getCredentialParam }
 import { addMMRInputParams, howToUseFileUpload, resolveVectorStoreOrRetriever } from '../VectorStoreUtils'
 import { index } from '../../../src/indexing'
 import { VertexVectorSearchStore, VertexVectorSearchConfig } from './core'
+import { VERTEX_CONSTANTS, CREDENTIAL_PARAMS, REQUIRED_INPUTS } from './constants'
 
 class VertexVectorSearch_VectorStores implements INode {
     label: string
@@ -146,66 +147,81 @@ class VertexVectorSearch_VectorStores implements INode {
         ]
     }
 
+    private validateRequiredInputs(nodeData: INodeData): void {
+        const missing = REQUIRED_INPUTS.filter(field => !nodeData.inputs?.[field])
+        if (missing.length) {
+            throw new Error(`Missing required fields: ${missing.join(', ')}`)
+        }
+    }
+
+    private async createAuth(nodeData: INodeData, options: ICommonObject): Promise<GoogleAuth> {
+        const credentialData = await getCredentialData(nodeData.credential ?? '', options)
+        const googleApplicationCredentialFilePath = getCredentialParam(CREDENTIAL_PARAMS.GOOGLE_APP_CREDENTIAL_FILE_PATH, credentialData, nodeData)
+        const googleApplicationCredential = getCredentialParam(CREDENTIAL_PARAMS.GOOGLE_APP_CREDENTIAL, credentialData, nodeData)
+        const projectID = getCredentialParam(CREDENTIAL_PARAMS.PROJECT_ID, credentialData, nodeData)
+
+        const authOptions: ICommonObject = {}
+        if (Object.keys(credentialData).length !== 0) {
+            if (!googleApplicationCredentialFilePath && !googleApplicationCredential)
+                throw new Error(VERTEX_CONSTANTS.ERROR_MESSAGES.MISSING_CREDENTIALS)
+            if (googleApplicationCredentialFilePath && !googleApplicationCredential)
+                authOptions.keyFile = googleApplicationCredentialFilePath
+            else if (!googleApplicationCredentialFilePath && googleApplicationCredential)
+                authOptions.credentials = JSON.parse(googleApplicationCredential)
+
+            if (projectID) authOptions.projectId = projectID
+        }
+
+        return new GoogleAuth({
+            scopes: VERTEX_CONSTANTS.SCOPES,
+            ...authOptions
+        })
+    }
+
+    private async buildConfig(nodeData: INodeData, options: ICommonObject): Promise<VertexVectorSearchConfig> {
+        const auth = await this.createAuth(nodeData, options)
+        const textKey = nodeData.inputs?.textKey as string
+        
+        return {
+            project: nodeData.inputs?.projectId as string,
+            location: nodeData.inputs?.location as string,
+            indexId: nodeData.inputs?.indexId as string,
+            indexEndpointId: nodeData.inputs?.indexEndpointId as string,
+            auth: auth,
+            textKey: textKey || VERTEX_CONSTANTS.DEFAULT_TEXT_KEY,
+            gcsBucketName: nodeData.inputs?.gcsBucketName as string
+        }
+    }
+
+    private processDocuments(docs: Document[], isFileUploadEnabled: boolean, chatId?: string): Document[] {
+        const flattenDocs = docs && docs.length ? flatten(docs) : []
+        const finalDocs = []
+        
+        for (let i = 0; i < flattenDocs.length; i += 1) {
+            if (flattenDocs[i] && flattenDocs[i].pageContent) {
+                if (isFileUploadEnabled && chatId) {
+                    flattenDocs[i].metadata = { ...flattenDocs[i].metadata, [FLOWISE_CHATID]: chatId }
+                }
+                finalDocs.push(new Document(flattenDocs[i]))
+            }
+        }
+        
+        return finalDocs
+    }
+
     //@ts-ignore
     vectorStoreMethods = {
         async upsert(nodeData: INodeData, options: ICommonObject): Promise<Partial<IndexingResult>> {
-            const projectId = nodeData.inputs?.projectId as string
-            const location = nodeData.inputs?.location as string
-            const indexId = nodeData.inputs?.indexId as string
-            const indexEndpointId = nodeData.inputs?.indexEndpointId as string
-            const gcsBucketName = nodeData.inputs?.gcsBucketName as string
+            const instance = new VertexVectorSearch_VectorStores()
+            instance.validateRequiredInputs(nodeData)
+            
             const docs = nodeData.inputs?.document as Document[]
             const embeddings = nodeData.inputs?.embeddings as Embeddings
             const recordManager = nodeData.inputs?.recordManager
-            const textKey = nodeData.inputs?.textKey as string
             const isFileUploadEnabled = nodeData.inputs?.fileUpload as boolean
 
-            if (!gcsBucketName) {
-                throw new Error('GCS Bucket Name is required for Batch index operations')
-            }
-
-            const credentialData = await getCredentialData(nodeData.credential ?? '', options)
-            const googleApplicationCredentialFilePath = getCredentialParam('googleApplicationCredentialFilePath', credentialData, nodeData)
-            const googleApplicationCredential = getCredentialParam('googleApplicationCredential', credentialData, nodeData)
-            const projectID = getCredentialParam('projectID', credentialData, nodeData)
-
-            const authOptions: ICommonObject = {}
-            if (Object.keys(credentialData).length !== 0) {
-                if (!googleApplicationCredentialFilePath && !googleApplicationCredential)
-                    throw new Error('Please specify your Google Application Credential')
-                if (googleApplicationCredentialFilePath && !googleApplicationCredential)
-                    authOptions.keyFile = googleApplicationCredentialFilePath
-                else if (!googleApplicationCredentialFilePath && googleApplicationCredential)
-                    authOptions.credentials = JSON.parse(googleApplicationCredential)
-
-                if (projectID) authOptions.projectId = projectID
-            }
-
-            const auth = new GoogleAuth({
-                scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-                ...authOptions
-            })
-
-            const flattenDocs = docs && docs.length ? flatten(docs) : []
-            const finalDocs = []
-            for (let i = 0; i < flattenDocs.length; i += 1) {
-                if (flattenDocs[i] && flattenDocs[i].pageContent) {
-                    if (isFileUploadEnabled && options.chatId) {
-                        flattenDocs[i].metadata = { ...flattenDocs[i].metadata, [FLOWISE_CHATID]: options.chatId }
-                    }
-                    finalDocs.push(new Document(flattenDocs[i]))
-                }
-            }
-
-            const config: VertexVectorSearchConfig = {
-                project: projectId,
-                location: location,
-                indexId: indexId,
-                indexEndpointId: indexEndpointId,
-                auth: auth,
-                textKey: textKey || 'text',
-                gcsBucketName: gcsBucketName
-            }
+            const config = await instance.buildConfig(nodeData, options)
+            const finalDocs = instance.processDocuments(docs, isFileUploadEnabled, options.chatId)
 
             try {
                 if (recordManager) {
@@ -218,7 +234,7 @@ class VertexVectorSearch_VectorStores implements INode {
                         options: {
                             cleanup: recordManager?.cleanup,
                             sourceIdKey: recordManager?.sourceIdKey ?? 'source',
-                            vectorStoreName: `vertex_${indexId}`
+                            vectorStoreName: `vertex_${config.indexId}`
                         }
                     })
 
@@ -228,59 +244,22 @@ class VertexVectorSearch_VectorStores implements INode {
                     return { numAdded: finalDocs.length, addedDocs: finalDocs }
                 }
             } catch (e) {
-                throw new Error(`Vertex AI Vector Search upsert error: ${e}`)
+                throw new Error(`${VERTEX_CONSTANTS.ERROR_MESSAGES.UPSERT_ERROR}: ${e}`)
             }
         },
 
         async delete(nodeData: INodeData, ids: string[], options: ICommonObject): Promise<void> {
-            const projectId = nodeData.inputs?.projectId as string
-            const location = nodeData.inputs?.location as string
-            const indexId = nodeData.inputs?.indexId as string
-            const indexEndpointId = nodeData.inputs?.indexEndpointId as string
-            const gcsBucketName = nodeData.inputs?.gcsBucketName as string
+            const instance = new VertexVectorSearch_VectorStores()
+            instance.validateRequiredInputs(nodeData)
+            
             const embeddings = nodeData.inputs?.embeddings as Embeddings
-            const textKey = nodeData.inputs?.textKey as string
             const recordManager = nodeData.inputs?.recordManager
 
-            if (!gcsBucketName) {
-                throw new Error('GCS Bucket Name is required for Batch index operations')
-            }
-
-            const credentialData = await getCredentialData(nodeData.credential ?? '', options)
-            const googleApplicationCredentialFilePath = getCredentialParam('googleApplicationCredentialFilePath', credentialData, nodeData)
-            const googleApplicationCredential = getCredentialParam('googleApplicationCredential', credentialData, nodeData)
-            const projectID = getCredentialParam('projectID', credentialData, nodeData)
-
-            const authOptions: ICommonObject = {}
-            if (Object.keys(credentialData).length !== 0) {
-                if (!googleApplicationCredentialFilePath && !googleApplicationCredential)
-                    throw new Error('Please specify your Google Application Credential')
-                if (googleApplicationCredentialFilePath && !googleApplicationCredential)
-                    authOptions.keyFile = googleApplicationCredentialFilePath
-                else if (!googleApplicationCredentialFilePath && googleApplicationCredential)
-                    authOptions.credentials = JSON.parse(googleApplicationCredential)
-
-                if (projectID) authOptions.projectId = projectID
-            }
-
-            const auth = new GoogleAuth({
-                scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-                ...authOptions
-            })
-
-            const config: VertexVectorSearchConfig = {
-                project: projectId,
-                location: location,
-                indexId: indexId,
-                indexEndpointId: indexEndpointId,
-                auth: auth,
-                textKey: textKey || 'text',
-                gcsBucketName: gcsBucketName
-            }
+            const config = await instance.buildConfig(nodeData, options)
 
             try {
                 if (recordManager) {
-                    const vectorStoreName = `vertex_${indexId}`
+                    const vectorStoreName = `vertex_${config.indexId}`
                     await recordManager.createSchema()
                     ;(recordManager as any).namespace = (recordManager as any).namespace + '_' + vectorStoreName
                     const keys: string[] = await recordManager.listKeys({})
@@ -293,71 +272,27 @@ class VertexVectorSearch_VectorStores implements INode {
                     await vertexStore.delete({ ids })
                 }
             } catch (e) {
-                throw new Error(`Vertex AI Vector Search delete error: ${e}`)
+                throw new Error(`${VERTEX_CONSTANTS.ERROR_MESSAGES.DELETE_ERROR}: ${e}`)
             }
         }
     }
 
     async init(nodeData: INodeData, _: string, options: ICommonObject): Promise<any> {
-        const projectId = nodeData.inputs?.projectId as string
-        const location = nodeData.inputs?.location as string
-        const indexId = nodeData.inputs?.indexId as string
-        const indexEndpointId = nodeData.inputs?.indexEndpointId as string
-        const gcsBucketName = nodeData.inputs?.gcsBucketName as string
+        this.validateRequiredInputs(nodeData)
+        
         const metadataFilter = nodeData.inputs?.metadataFilter
         const embeddings = nodeData.inputs?.embeddings as Embeddings
-        const textKey = nodeData.inputs?.textKey as string
         const isFileUploadEnabled = nodeData.inputs?.fileUpload as boolean
 
-        if (!gcsBucketName) {
-            throw new Error('GCS Bucket Name is required for Batch index operations')
-        }
-
-        const credentialData = await getCredentialData(nodeData.credential ?? '', options)
-        const googleApplicationCredentialFilePath = getCredentialParam('googleApplicationCredentialFilePath', credentialData, nodeData)
-        const googleApplicationCredential = getCredentialParam('googleApplicationCredential', credentialData, nodeData)
-        const projectID = getCredentialParam('projectID', credentialData, nodeData)
-
-        const authOptions: ICommonObject = {}
-        if (Object.keys(credentialData).length !== 0) {
-            if (!googleApplicationCredentialFilePath && !googleApplicationCredential)
-                throw new Error('Please specify your Google Application Credential')
-            if (googleApplicationCredentialFilePath && !googleApplicationCredential)
-                authOptions.keyFile = googleApplicationCredentialFilePath
-            else if (!googleApplicationCredentialFilePath && googleApplicationCredential)
-                authOptions.credentials = JSON.parse(googleApplicationCredential)
-
-            if (projectID) authOptions.projectId = projectID
-        }
-
-        console.log(`[VertexVectorSearch] Creating GoogleAuth with options:`, { 
-            scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-            projectId: authOptions.projectId || 'not specified',
-            hasKeyFile: !!authOptions.keyFile,
-            hasCredentials: !!authOptions.credentials
-        })
-        const auth = new GoogleAuth({
-            scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-            ...authOptions
-        })
-
-        const config: VertexVectorSearchConfig = {
-            project: projectId,
-            location: location,
-            indexId: indexId,
-            indexEndpointId: indexEndpointId,
-            auth: auth,
-            textKey: textKey || 'text',
-            gcsBucketName: gcsBucketName
-        }
+        const config = await this.buildConfig(nodeData, options)
         
         console.log(`[VertexVectorSearch] Created config:`, {
-            project: projectId,
-            location: location,
-            indexId: indexId,
-            indexEndpointId: indexEndpointId,
-            textKey: textKey || 'text',
-            gcsBucketName: gcsBucketName
+            project: config.project,
+            location: config.location,
+            indexId: config.indexId,
+            indexEndpointId: config.indexEndpointId,
+            textKey: config.textKey,
+            gcsBucketName: config.gcsBucketName
         })
 
         console.log(`[VertexVectorSearch] Creating vector store from existing index...`)
